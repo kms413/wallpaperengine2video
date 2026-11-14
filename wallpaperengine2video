@@ -1,0 +1,688 @@
+#!/usr/bin/env python3
+"""wallpaperengine2video —— 把 Wallpaper Engine 壁纸导出成 mp4（视频/场景都支持）
+
+场景壁纸默认走"定步长离线渲染"：用 LD_PRELOAD 时钟垫片（lib/we_clock.so）
+冻结渲染器的虚拟时间，每步进 1/fps 秒完整渲染并抓取一帧，GPU 性能只影响
+导出耗时，不丢帧，输出严格恒定帧率。--realtime 回退旧的实时录制管线。
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+APPID = "431960"
+VIDEO_EXT = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+MAGIC = b"PKGM0014"
+# 时钟垫片：优先取脚本同目录的 lib/we_clock.so，其次 ~/.local/bin/lib
+_SHIM_CANDIDATES = (
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "we_clock.so"),
+    os.path.expanduser("~/.local/bin/lib/we_clock.so"),
+)
+SHIM = next((p for p in _SHIM_CANDIDATES if os.path.exists(p)),
+            os.path.expanduser("~/.local/bin/lib/we_clock.so"))
+
+
+# --------------------------------------------------------------------------- #
+# Steam 库
+# --------------------------------------------------------------------------- #
+def steam_roots() -> list[str]:
+    roots = [os.path.expanduser("~/.local/share/Steam"), os.path.expanduser("~/.steam/steam")]
+    vdf = os.path.expanduser("~/.local/share/Steam/steamapps/libraryfolders.vdf")
+    if os.path.exists(vdf):
+        try:
+            txt = open(vdf, encoding="utf-8", errors="replace").read()
+            roots += re.findall(r'"path"\s+"([^"]+)"', txt)
+        except OSError:
+            pass
+    out, seen = [], set()
+    for r in roots:
+        r = os.path.realpath(os.path.expanduser(r))
+        if r not in seen and os.path.isdir(r):
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def workshop_dirs() -> list[str]:
+    dirs = []
+    for root in steam_roots():
+        for c in (os.path.join(root, "steamapps", "workshop", "content", APPID),
+                  os.path.join(root, "workshop", "content", APPID)):
+            if os.path.isdir(c):
+                dirs.append(c)
+    return dirs
+
+
+def iter_items():
+    seen = set()
+    for base in workshop_dirs():
+        for item_id in sorted(os.listdir(base)):
+            path = os.path.join(base, item_id)
+            if not os.path.isdir(path):
+                continue
+            real = os.path.realpath(path)
+            if item_id in seen or real in seen:
+                continue
+            seen.update((item_id, real))
+            yield item_id, path
+
+
+def find_item(item_id: str) -> str | None:
+    for iid, path in iter_items():
+        if iid == item_id:
+            return path
+    return None
+
+
+def meta_of(path: str) -> dict:
+    pj = os.path.join(path, "project.json")
+    if not os.path.exists(pj):
+        return {}
+    try:
+        return json.load(open(pj, encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+
+
+def classify(path: str) -> str:
+    f = str(meta_of(path).get("file", "")).lower()
+    if f.endswith(tuple(VIDEO_EXT)):
+        return "video"
+    if f.endswith(".pkg") or os.path.exists(os.path.join(path, "scene.pkg")):
+        return "scene"
+    if f.endswith((".html", ".htm")) or os.path.exists(os.path.join(path, "index.html")):
+        return "web"
+    for n in os.listdir(path):
+        if os.path.splitext(n)[1].lower() in VIDEO_EXT:
+            return "video"
+    return "unknown"
+
+
+def video_file(path: str) -> str | None:
+    cand = str(meta_of(path).get("file", ""))
+    p = os.path.join(path, cand)
+    if cand and os.path.isfile(p) and os.path.splitext(p)[1].lower() in VIDEO_EXT:
+        return p
+    vids = [os.path.join(path, n) for n in os.listdir(path)
+            if os.path.splitext(n)[1].lower() in VIDEO_EXT
+            and os.path.isfile(os.path.join(path, n))]
+    return max(vids, key=os.path.getsize) if vids else None
+
+
+# --------------------------------------------------------------------------- #
+# .mpkg
+# --------------------------------------------------------------------------- #
+def mpkg_unpack(src: str, workdir: str) -> dict[str, str]:
+    data = open(src, "rb").read()
+    if len(data) < 16 or data[4:12] != MAGIC:
+        raise ValueError("不是 PKGM0014 格式")
+    count, = struct.unpack_from("<I", data, 12)
+    pos, entries = 16, []
+    for _ in range(count):
+        nlen, = struct.unpack_from("<I", data, pos)
+        pos += 4
+        name = data[pos:pos + nlen].decode("utf-8", "replace")
+        pos += nlen
+        off, size = struct.unpack_from("<II", data, pos)
+        pos += 8
+        entries.append((name, off, size))
+    out = {}
+    for name, off, size in entries:
+        base = os.path.basename(name.replace("\\", "/")) or f"e{len(out)}"
+        dst = os.path.join(workdir, base)
+        open(dst, "wb").write(data[pos + off:pos + off + size])
+        out[base] = dst
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# 小工具
+# --------------------------------------------------------------------------- #
+def safe_name(s: str, fallback: str) -> str:
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", s).strip(" .")
+    return (re.sub(r"\s+", " ", s)[:80].strip(" .")) or fallback
+
+
+def probe(p: str) -> dict:
+    try:
+        o = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_name,width,height",
+                            "-show_entries", "format=duration,size", "-of", "json", p],
+                           capture_output=True, text=True).stdout
+        d = json.loads(o or "{}")
+        st = (d.get("streams") or [{}])[0]
+        fm = d.get("format") or {}
+        return {"codec": st.get("codec_name"), "width": st.get("width"),
+                "height": st.get("height"), "duration": float(fm.get("duration") or 0),
+                "bytes": int(fm.get("size") or 0)}
+    except Exception:
+        return {"bytes": os.path.getsize(p) if os.path.exists(p) else 0}
+
+
+def probe_frames(path: str) -> dict:
+    try:
+        o = subprocess.run(["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
+                            "-show_entries", "stream=nb_read_packets",
+                            "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                           capture_output=True, text=True).stdout.split()
+        frames = int(o[0]) if o and o[0].isdigit() else 0
+        dur = float(o[1]) if len(o) > 1 else 0.0
+        return {"frames": frames, "fps": (frames / dur) if dur else 0.0}
+    except Exception:
+        return {"frames": 0, "fps": 0.0}
+
+
+def lwe_bin() -> str | None:
+    for cand in (shutil.which("linux-wallpaperengine"),
+                 os.path.expanduser("~/.local/opt/linux-wallpaperengine/linux-wallpaperengine")):
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# 场景渲染：无头 sway + linux-wallpaperengine + wf-recorder
+# --------------------------------------------------------------------------- #
+class Headless:
+    """离屏 Wayland 合成器（GPU 渲染，不占用用户的屏幕）。"""
+
+    def __init__(self, size=(1920, 1080), fps=60):
+        self.size = size
+        self.dir = tempfile.mkdtemp(prefix="we2v_")
+        os.chmod(self.dir, 0o700)
+        w, h = size
+        cfg = os.path.join(self.dir, "sway.conf")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            fh.write(f"output HEADLESS-1 resolution {w}x{h}@{fps}Hz\n"
+                     "output * bg #000000 solid_color\n")
+        self.env = {k: v for k, v in os.environ.items()
+                    if k not in ("WAYLAND_DISPLAY", "DISPLAY")}
+        self.env.update(XDG_RUNTIME_DIR=self.dir, WLR_BACKENDS="headless",
+                        WLR_RENDERER="gles2", WLR_LIBINPUT_NO_DEVICES="1")
+        self.sway = subprocess.Popen(["sway", "-c", cfg], env=self.env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sock = None
+        for _ in range(100):
+            hits = glob.glob(os.path.join(self.dir, "wayland-*"))
+            if hits:
+                sock = os.path.basename(hits[0])
+                break
+            time.sleep(0.1)
+        if not sock:
+            self.close()
+            raise RuntimeError("无头 sway 启动失败")
+        self.env["WAYLAND_DISPLAY"] = sock
+        for _ in range(50):
+            o = subprocess.run(["swaymsg", "-t", "get_outputs"], env=self.env,
+                               capture_output=True, text=True)
+            if '"name"' in (o.stdout or ""):
+                break
+            time.sleep(0.1)
+
+    def close(self):
+        try:
+            self.sway.send_signal(signal.SIGTERM)
+            self.sway.wait(timeout=5)
+        except Exception:
+            self.sway.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def normalize_cfr(src: str, dst: str, fps: int, duration: float | None = None) -> None:
+    """把可变帧率录制流重定时为严格恒定 fps（缺帧补齐，不产生空洞）。"""
+    dev = "/dev/dri/renderD128"
+    trim = ["-t", f"{duration:.3f}"] if duration else []
+    if os.path.exists(dev):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-vaapi_device", dev,
+               "-i", src, *trim, "-vf", f"fps={fps},format=nv12,hwupload",
+               "-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", "19",
+               "-movflags", "+faststart", dst]
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            return
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src, *trim,
+           "-vf", f"fps={fps}", "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+           "-movflags", "+faststart", dst]
+    if subprocess.run(cmd, capture_output=True).returncode != 0:
+        raise RuntimeError("帧率归一化失败")
+
+
+def _frame_brightness(env: dict) -> float:
+    """在当前会话里截一帧，返回 0-255 平均亮度；失败返回 0。"""
+    try:
+        png = subprocess.run(["grim", "-"], env=env, capture_output=True,
+                             timeout=5).stdout
+        if not png:
+            return 0.0
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-i", "-", "-vf", "scale=32:32",
+                              "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                             input=png, capture_output=True, timeout=10).stdout
+        return (sum(raw) / len(raw)) if raw else 0.0
+    except Exception:
+        return 0.0
+
+
+# --------------------------------------------------------------------------- #
+# 定步长渲染：时钟垫片 + 逐帧抓取（确定性，不丢帧）
+# --------------------------------------------------------------------------- #
+def _ctl(fifo: str, cmd: str) -> None:
+    """向时钟垫片的控制 FIFO 写一条命令（step/freeze/run）。"""
+    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    try:
+        os.write(fd, (cmd + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def _grab_ppm(env: dict, scale: float | None = None) -> bytes | None:
+    """从无头合成器抓一帧 PPM（scale<1 时为缩略探针）。"""
+    argv = ["grim", "-o", "HEADLESS-1", "-t", "ppm"]
+    if scale:
+        argv += ["-s", str(scale)]
+    argv.append("-")
+    try:
+        r = subprocess.run(argv, env=env, capture_output=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout or None
+
+
+def _ppm_hash(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+def _ppm_brightness_probe(data: bytes) -> float:
+    """PPM 探针帧的 0-255 平均亮度（RGB 等权近似）。"""
+    return (sum(data) / len(data)) if data else 0.0
+
+
+def render_scene_stepped(target: str, out: str, seconds: float,
+                         size: tuple[int, int], fps: int) -> dict:
+    """冻结虚拟时钟，逐帧步进渲染 + 抓取。
+
+    每一帧都等渲染器完整画完才采集（探针 hash 感知变化 + 全帧核验），
+    GPU 再慢也只是导出变慢，输出帧数严格等于 fps×时长，零重复帧。
+    """
+    if not os.path.exists(SHIM):
+        raise RuntimeError("未找到时钟垫片 " + SHIM)
+    if not shutil.which("grim"):
+        raise RuntimeError("缺少 grim")
+    bin_lwe = lwe_bin()
+    if not bin_lwe:
+        raise RuntimeError("缺少 linux-wallpaperengine")
+    if not shutil.which("sway"):
+        raise RuntimeError("缺少 sway：sudo apt install sway")
+
+    w, h = size
+    total = max(1, round(seconds * fps))
+    sess = Headless(size, fps)
+    lwe = enc = None
+    try:
+        fifo = os.path.join(sess.dir, "clock.ctl")
+        os.mkfifo(fifo)
+        env = dict(sess.env)
+        env.update(LD_PRELOAD=SHIM, WE_CLOCK_FIFO=fifo,
+                   WE_CLOCK_STEP_NS=str(max(1000000, round(1e9 / fps))))
+
+        lwe = subprocess.Popen(
+            [bin_lwe, "--window", f"0x0x{w}x{h}", "--fps", "15",
+             "--silent", "--noautomute", target],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # 等首帧出图（冻结前先正常跑，避免启动期依赖时钟的初始化被卡死）
+        first = None
+        for _ in range(60):
+            if lwe.poll() is not None:
+                raise RuntimeError("渲染器无法加载该壁纸（进程退出）")
+            first = _grab_ppm(env, 0.125)
+            if first and _ppm_brightness_probe(first) > 8:
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("等待首帧超时")
+        _ctl(fifo, "freeze")
+
+        # 校准：3 次步进测量单帧渲染延迟，确定每帧等待上限
+        last_hash = _ppm_hash(_grab_ppm(env, 0.125) or b"")
+        worst = 0.0
+        for _ in range(3):
+            _ctl(fifo, "step")
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 2.0:
+                if _ppm_hash(_grab_ppm(env, 0.125) or b"") != last_hash:
+                    break
+                time.sleep(0.02)
+            worst = max(worst, time.monotonic() - t0)
+            last_hash = _ppm_hash(_grab_ppm(env, 0.125) or b"")
+        wait_cap = max(0.6, min(2.0, worst * 4))
+
+        enc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "image2pipe", "-framerate", str(fps), "-i", "-",
+             "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
+             "-r", str(fps), "-movflags", "+faststart", out],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE)
+
+        written, timeouts, static_at, last_full = 0, 0, None, None
+        for i in range(total):
+            if lwe.poll() is not None:
+                raise RuntimeError("渲染器中途退出")
+            _ctl(fifo, "step")
+            t0 = time.monotonic()
+            probe_changed = False
+            while time.monotonic() - t0 < wait_cap:
+                p = _grab_ppm(env, 0.125)
+                if p and _ppm_hash(p) != last_hash:
+                    probe_changed = True
+                    break
+                time.sleep(0.02)
+
+            full = _grab_ppm(env)
+            if not full:
+                raise RuntimeError("全帧抓取失败")
+            fhash = _ppm_hash(full)
+            if probe_changed:
+                last_hash = fhash
+                timeouts = 0
+            elif last_full is None or fhash != _ppm_hash(last_full):
+                # 探针没感知到但全帧确实变了（微小动画）：接受该帧
+                last_hash = fhash
+                timeouts = 0
+            else:
+                timeouts += 1
+                if timeouts >= 12:
+                    static_at = written
+                    break
+            last_full = full
+            try:
+                enc.stdin.write(full)
+                written += 1
+            except BrokenPipeError:
+                err = (enc.stderr.read() or b"").decode("utf-8", "replace").strip()
+                raise RuntimeError("编码器退出：" + (err[-160:] or "未知原因"))
+
+        if static_at is not None and last_full:
+            for _ in range(total - written):   # 静态画面：补齐剩余帧
+                enc.stdin.write(last_full)
+                written += 1
+
+        if written == 0:
+            raise RuntimeError("没有抓到任何帧")
+        enc.stdin.close()
+        enc.wait(timeout=300)
+        if enc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
+            err = (enc.stderr.read() or b"").decode("utf-8", "replace").strip()
+            raise RuntimeError("编码失败：" + (err[-160:] or "未知原因"))
+        info = probe_frames(out)
+        return {"encoder": "x264", "frames": info["frames"],
+                "real_fps": info["fps"], "pipeline": "stepped",
+                "static": static_at is not None}
+    finally:
+        if lwe and lwe.poll() is None:
+            lwe.kill()
+        if enc:
+            try:
+                if enc.stdin and not enc.stdin.closed:
+                    enc.stdin.close()
+            except OSError:
+                pass
+            if enc.poll() is None:
+                enc.kill()
+        sess.close()
+
+
+def render_scene_realtime(target: str, out: str, seconds: float,
+                          size: tuple[int, int], fps: int) -> dict:
+    bin_lwe, bin_wf = lwe_bin(), shutil.which("wf-recorder")
+    if not bin_lwe:
+        raise RuntimeError("缺少 linux-wallpaperengine")
+    if not shutil.which("sway"):
+        raise RuntimeError("缺少 sway：sudo apt install sway")
+    if not bin_wf:
+        raise RuntimeError("缺少 wf-recorder：sudo apt install wf-recorder")
+
+    w, h = size
+    sess = Headless(size, fps)
+    lwe = None
+    try:
+        lwe = subprocess.Popen(
+            [bin_lwe, "--window", f"0x0x{w}x{h}", "--fps", str(fps),
+             "--silent", "--noautomute", target],
+            env=sess.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # 等画面真正出图（平均亮度 > 8 视为已渲染），最多等 20 秒
+        for _ in range(40):
+            if lwe.poll() is not None:
+                break
+            if _frame_brightness(sess.env) > 8:
+                break
+            time.sleep(0.5)
+        if lwe.poll() is not None:
+            err = (lwe.stderr.read() or b"").decode("utf-8", "replace").strip()
+            first = (err.splitlines() or [""])[-1]
+            raise RuntimeError("渲染器无法加载该壁纸：" + first[:160])
+
+        # 优先 GPU 硬编（VAAPI）：把 CPU 全部留给渲染器，避免抢核掉帧
+        encoders = [
+            ("vaapi", ["-c", "h264_vaapi", "-d", "/dev/dri/renderD128",
+                       "-p", "rc_mode=CQP", "-p", "qp=19"]),
+            ("x264", ["-c", "libx264", "-p", "preset=superfast", "-p", "crf=18"]),
+        ]
+        chosen = encoders[0]
+        if not os.path.exists("/dev/dri/renderD128"):
+            chosen = encoders[1]
+        raw = out + ".raw.mp4"
+        rec = subprocess.Popen(
+            [bin_wf, "-f", raw, "-r", str(fps), "-D", *chosen[1]],
+            env=sess.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        time.sleep(seconds + 0.7)
+        rec.send_signal(signal.SIGINT)
+        _, rerr = rec.communicate(timeout=90)
+        if not os.path.exists(raw) or os.path.getsize(raw) < 1024:
+            tail = (rerr or b"").decode("utf-8", "replace").strip().splitlines()
+            raise RuntimeError("录制失败：" + (tail[-1][:160] if tail else "未知原因"))
+
+        # 恒定帧率重定时：把采集抖动/丢帧补齐，输出严格 fps 帧/秒
+        normalize_cfr(raw, out, fps, seconds)
+        try:
+            os.unlink(raw)
+        except OSError:
+            pass
+        info = probe_frames(out)
+        return {"encoder": chosen[0], "frames": info["frames"], "real_fps": info["fps"]}
+    finally:
+        if lwe and lwe.poll() is None:
+            lwe.kill()
+        sess.close()
+
+
+# --------------------------------------------------------------------------- #
+# 导出
+# --------------------------------------------------------------------------- #
+def render_scene(target: str, out: str, seconds: float, size: tuple[int, int],
+                 fps: int, realtime: bool = False) -> dict:
+    """场景渲染入口：默认定步长（确定性），失败自动回退实时录制。"""
+    if not realtime:
+        try:
+            return render_scene_stepped(target, out, seconds, size, fps)
+        except (RuntimeError, OSError) as exc:
+            print(f"  [步进渲染失败，回退实时录制] {exc}", file=sys.stderr)
+    info = render_scene_realtime(target, out, seconds, size, fps)
+    info["pipeline"] = "realtime"
+    return info
+
+
+def export_video(src: str, dst: str) -> str:
+    if src.lower().endswith(".mp4"):
+        shutil.copy2(src, dst)
+        return "copy"
+    steps = ((["-i", src, "-c", "copy", "-movflags", "+faststart"], "remux"),
+             (["-i", src, "-c:v", "libx264", "-crf", "20", "-preset", "medium",
+               "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"], "reencode"))
+    for av, mode in steps:
+        if subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *av, dst],
+                          capture_output=True).returncode == 0:
+            return mode
+    raise RuntimeError("ffmpeg 转换失败")
+
+
+def do_export(target: str, args) -> tuple[int, dict]:
+    res: dict = {"input": target, "ok": False}
+
+    if target.lower().endswith(".mpkg"):
+        with tempfile.TemporaryDirectory(prefix="mpkg_") as tmp:
+            try:
+                files = mpkg_unpack(target, tmp)
+            except (OSError, ValueError, struct.error) as exc:
+                res["error"] = str(exc)
+                return 1, res
+            vids = [p for p in files.values() if os.path.splitext(p)[1].lower() in VIDEO_EXT]
+            if not vids:
+                res["error"] = "mpkg 内没有视频"
+                return 2, res
+            dst = os.path.join(args.out,
+                               os.path.splitext(os.path.basename(target))[0] + ".mp4")
+            if os.path.exists(dst) and not args.force:
+                res.update(mp4=dst, note="已存在，跳过", ok=True)
+                return 0, res
+            res.update(mp4=dst, mode=export_video(max(vids, key=os.path.getsize), dst), ok=True)
+            res.update(probe(dst))
+            return 0, res
+
+    path = target if os.path.isdir(target) else find_item(target)
+    if not path:
+        res["error"] = f"找不到条目 {target}（未订阅/未下载？）"
+        return 3, res
+
+    meta = meta_of(path)
+    item_id = os.path.basename(path.rstrip("/"))
+    title = safe_name(str(meta.get("title") or ""), item_id)
+    kind = classify(path)
+    dst = os.path.join(args.out, f"{item_id}_{title}.mp4")
+    res.update(id=item_id, title=title, kind=kind, source=path)
+
+    if os.path.exists(dst) and not args.force:
+        res.update(mp4=dst, note="已存在，跳过", ok=True)
+        return 0, res
+
+    if kind == "video":
+        src = video_file(path)
+        if not src:
+            res["error"] = "判定为视频类但没找到视频文件"
+            return 1, res
+        res["mode"] = export_video(src, dst)
+    else:
+        render_target = item_id if not os.path.isdir(target) else path
+        try:
+            rinfo = render_scene(render_target, dst, args.seconds, args.size,
+                                 args.fps, args.realtime)
+        except RuntimeError as exc:
+            res["error"] = str(exc)
+            return 1, res
+        res["mode"] = f"render/{rinfo['encoder']}/{rinfo.get('pipeline', 'realtime')}"
+        if rinfo.get("static"):
+            res["note"] = "画面判定为静态"
+        res["real_fps"] = round(rinfo["real_fps"], 1)
+
+    res.update(mp4=dst, ok=True)
+    res.update(probe(dst))
+    return 0, res
+
+
+def list_items(as_json: bool) -> int:
+    rows = []
+    for iid, path in iter_items():
+        meta = meta_of(path)
+        rows.append({"id": iid, "title": meta.get("title") or "", "kind": classify(path),
+                     "size_mb": round(sum(os.path.getsize(os.path.join(dp, f))
+                                          for dp, _, fs in os.walk(path) for f in fs) / 1048576, 1),
+                     "source": path})
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    print(f"{'ID':<12}{'类型':<8}{'大小':>8}  标题")
+    for r in rows:
+        print(f"{r['id']:<12}{r['kind']:<8}{r['size_mb']:>7}M  {r['title'][:46]}  "
+              f"[{'可直出' if r['kind'] == 'video' else '需渲染'}]")
+    print(f"\n共 {len(rows)} 个")
+    return 0
+
+
+def parse_size(text: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{3,5})[xX](\d{3,5})", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError("尺寸格式应为 1920x1080")
+    return int(m.group(1)), int(m.group(2))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="wallpaperengine2video",
+        description="Wallpaper Engine 壁纸 -> mp4。视频壁纸无损直出；场景壁纸自动离屏渲染。")
+    ap.add_argument("targets", nargs="*", help="工坊 ID / .mpkg / 壁纸目录")
+    ap.add_argument("-o", "--out", default="mp4", help="输出目录（默认 ./mp4）")
+    ap.add_argument("-t", "--seconds", type=float, default=10, help="场景渲染时长，秒（默认 10）")
+    ap.add_argument("--size", type=parse_size, default=(1920, 1080), help="渲染分辨率（默认 1920x1080）")
+    ap.add_argument("--fps", type=int, default=60, help="帧率（默认 60）")
+    ap.add_argument("--list", action="store_true", help="列出本地壁纸及类型")
+    ap.add_argument("--all", action="store_true", help="导出所有壁纸")
+    ap.add_argument("--json", action="store_true", help="JSON 输出")
+    ap.add_argument("--force", action="store_true", help="覆盖已存在文件")
+    ap.add_argument("--realtime", action="store_true",
+                    help="强制实时录制（旧行为，帧率受 GPU 性能影响）")
+    args = ap.parse_args()
+
+    if args.list:
+        return list_items(args.json)
+    if shutil.which("ffmpeg") is None:
+        print("需要 ffmpeg", file=sys.stderr)
+        return 1
+
+    targets = list(args.targets)
+    if args.all:
+        targets += [iid for iid, _ in iter_items()]
+    if not targets:
+        ap.print_help()
+        return 1
+
+    os.makedirs(args.out, exist_ok=True)
+    results, worst = [], 0
+    for t in targets:
+        code, res = do_export(t, args)
+        worst = max(worst, 0 if code == 0 else code)
+        results.append(res)
+        if args.json:
+            continue
+        if res.get("ok"):
+            if res.get("note"):
+                print(f"= {t}: {res['note']} -> {res['mp4']}")
+            else:
+                print(f"✓ {t} -> {os.path.basename(res['mp4'])}  "
+                      f"{res.get('width')}x{res.get('height')} "
+                      f"{res.get('duration') or 0:.1f}s "
+                      f"{res.get('bytes', 0) / 1048576:.1f}MB ({res.get('mode')})")
+        else:
+            print(f"✗ {t}: {res.get('error')}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        ok = sum(1 for r in results if r.get("ok"))
+        print(f"\n完成 {ok}/{len(results)} -> {os.path.abspath(args.out)}")
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main())
