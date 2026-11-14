@@ -86,7 +86,8 @@ wallpaperengine2video 3497756108          # 按工坊 ID 导出（5 秒 1080p60 
 wallpaperengine2video 3497756108 -t 15 --fps 60 --size 1920x1080
 wallpaperengine2video ~/Downloads/xxx.mpkg   # 导出 .mpkg
 wallpaperengine2video --all -o ~/videos   # 导出全部壁纸
-wallpaperengine2video 3497756108 --json   # JSON 输出（便于脚本处理）
+wallpaperengine2video --json --all        # JSON 输出（便于脚本处理）
+wallpaperengine2video 3796111092 --normalize  # 4K60 等高解码压力源转 1080p 严格 CFR
 ```
 
 | 参数 | 说明 | 默认 |
@@ -100,6 +101,7 @@ wallpaperengine2video 3497756108 --json   # JSON 输出（便于脚本处理）
 | `--json` | JSON 输出 | |
 | `--force` | 覆盖已存在文件 | |
 | `--realtime` | 强制实时录制（旧行为，帧率受 GPU 影响） | |
+| `--normalize` | 视频重编码为严格 CFR + 1080p 上限（VAAPI 硬编优先） | |
 
 ### 已知限制
 

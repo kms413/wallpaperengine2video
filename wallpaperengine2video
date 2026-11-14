@@ -538,6 +538,52 @@ def export_video(src: str, dst: str) -> str:
     raise RuntimeError("ffmpeg 转换失败")
 
 
+def export_video_norm(src: str, dst: str, max_h: int = 1080) -> str:
+    """重编码为严格 CFR、硬件友好的 mp4。
+
+    针对高分辨率/高帧率源（如 4K60 H264）：弱解码器/软解播放会卡顿，
+    转成 ≤1080p + 严格恒定帧率 + faststart 后几乎所有设备都能流畅播放。
+    VFR 源同时被 fps 滤镜重定时为恒定帧率。
+    """
+    info = probe(src)
+    fps = round(probe_frames(src)["fps"]) or 60
+    vf = [f"fps={max(1, fps)}"]
+    if (info.get("height") or max_h) > max_h:
+        vf.append(f"scale=-2:{max_h}")
+    audio = ["-c:a", "aac", "-b:a", "192k"]
+    dev = "/dev/dri/renderD128"
+    if os.path.exists(dev):
+        chain = ",".join(vf + ["format=nv12", "hwupload"])
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-vaapi_device", dev, "-i", src, "-vf", chain,
+               "-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", "21",
+               *audio, "-movflags", "+faststart", dst]
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            return "normalize/vaapi"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+           "-vf", ",".join(vf), "-c:v", "libx264", "-crf", "19", "-preset", "veryfast",
+           *audio, "-movflags", "+faststart", dst]
+    if subprocess.run(cmd, capture_output=True).returncode != 0:
+        raise RuntimeError("normalize 转码失败")
+    return "normalize/x264"
+
+
+def warn_if_heavy(src: str) -> bool:
+    """高解码压力的源（>1080p 且 ≥50fps 的 H264）提示可用 --normalize。"""
+    info = probe(src)
+    try:
+        fps = probe_frames(src)["fps"]
+    except Exception:
+        fps = 0
+    if (info.get("codec") == "h264" and (info.get("width") or 0) * (info.get("height") or 0)
+            > 1920 * 1080 and fps >= 50):
+        print(f"  [提示] {os.path.basename(src)} 为 {(info.get('width'))}x{(info.get('height'))}"
+              f"@{round(fps)} H264，软解/弱设备播放可能卡顿；如遇卡顿可加 --normalize 重新导出",
+              file=sys.stderr)
+        return True
+    return False
+
+
 def do_export(target: str, args) -> tuple[int, dict]:
     res: dict = {"input": target, "ok": False}
 
@@ -557,7 +603,12 @@ def do_export(target: str, args) -> tuple[int, dict]:
             if os.path.exists(dst) and not args.force:
                 res.update(mp4=dst, note="已存在，跳过", ok=True)
                 return 0, res
-            res.update(mp4=dst, mode=export_video(max(vids, key=os.path.getsize), dst), ok=True)
+            src = max(vids, key=os.path.getsize)
+            if args.normalize:
+                res.update(mp4=dst, mode=export_video_norm(src, dst), ok=True)
+            else:
+                res.update(mp4=dst, mode=export_video(src, dst), ok=True)
+                warn_if_heavy(src)
             res.update(probe(dst))
             return 0, res
 
@@ -582,7 +633,11 @@ def do_export(target: str, args) -> tuple[int, dict]:
         if not src:
             res["error"] = "判定为视频类但没找到视频文件"
             return 1, res
-        res["mode"] = export_video(src, dst)
+        if args.normalize:
+            res["mode"] = export_video_norm(src, dst)
+        else:
+            res["mode"] = export_video(src, dst)
+            warn_if_heavy(src)
     else:
         render_target = item_id if not os.path.isdir(target) else path
         try:
@@ -642,6 +697,8 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="覆盖已存在文件")
     ap.add_argument("--realtime", action="store_true",
                     help="强制实时录制（旧行为，帧率受 GPU 性能影响）")
+    ap.add_argument("--normalize", action="store_true",
+                    help="视频重编码为严格恒定帧率 + 1080p 上限（4K60 等高解码压力源的流畅播放）")
     args = ap.parse_args()
 
     if args.list:
